@@ -1,2 +1,0 @@
-[console_scripts]
-payment-agent = apps.cli:main

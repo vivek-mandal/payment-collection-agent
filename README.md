@@ -9,14 +9,34 @@ account lookup → identity verification → card payment processing.
 
 ### 1. Install
 
+**Option A — `uv` (recommended, faster)**
+
 ```bash
-uv sync
-# or with dev tools (ruff, pytest, mypy):
-uv sync --extra dev
+pip install uv          # one-time, if you don't have uv yet
+uv sync                 # installs all runtime deps into .venv automatically
+uv sync --extra dev     # also installs pytest, ruff, mypy
 ```
 
-`uv` handles the virtual environment automatically — no `python -m venv` or `source activate` needed.
-If you don't have `uv`: `pip install uv` or see https://docs.astral.sh/uv/
+`uv` manages the virtual environment for you — no `python -m venv` or `source activate` needed.
+All subsequent commands (`uv run …`) use the venv automatically.
+
+**Option B — plain `pip`**
+
+```bash
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
+pip install -e .        # installs the package itself in editable mode
+```
+
+> `requirements.txt` is generated from the locked `uv.lock` and pins every
+> transitive dependency to the exact version used during development.
 
 ### 2. Configure
 
@@ -33,13 +53,21 @@ The agent auto-detects which provider to use based on which variables are set.
 ### 3. Run interactively
 
 ```bash
+# uv
 uv run python -m apps.cli
+
+# plain pip (venv activated)
+python -m apps.cli
 ```
 
 ### 4. Run the evaluation suite
 
 ```bash
-uv run pytest tests/e2e -v -s
+# uv
+uv run python -m pytest tests/e2e -v -s
+
+# plain pip (venv activated)
+pytest tests/e2e -v -s
 ```
 
 ---
@@ -48,8 +76,8 @@ uv run pytest tests/e2e -v -s
 
 ```
 payment-agent/
-├── pyproject.toml                  # dependencies + tooling config (uv reads this)
-├── Makefile                        # shortcuts: uv sync / uv run / etc.
+├── pyproject.toml                  # primary dependency spec (uv)
+├── requirements.txt                # pip-compatible lockfile (generated from uv.lock)
 ├── .env.example                    # config template — copy to .env
 ├── .pre-commit-config.yaml
 ├── docs/
@@ -201,6 +229,19 @@ Agent : Identity verified. Your outstanding balance is ₹3,200.50...
 
 ## Evaluation
 
+An automated evaluation suite is included at `tests/e2e/test_agent_flows.py`.
+**All 20 tests pass.**
+
+```bash
+# uv
+uv run python -m pytest tests/e2e -v
+
+# plain pip (venv activated)
+pytest tests/e2e -v
+```
+
+![Eval results — 20 passed](docs/assets/eval_results.png)
+
 20 deterministic test cases covering:
 
 | Category | Tests |
@@ -214,4 +255,30 @@ Agent : Identity verified. Your outstanding balance is ₹3,200.50...
 | Edge cases (leap year, case sensitivity, out-of-order input) | 5 |
 
 Tests assert on `agent.state`, `agent.verified`, and `agent.payment_result` —
-not on LLM-generated text — making them deterministic across runs.
+not on LLM-generated text — making them deterministic and stable across runs
+regardless of LLM response phrasing.
+
+---
+
+## Key Design Decisions
+
+> Full rationale is in [`docs/design.md`](docs/design.md). Summarised here for quick review.
+
+**Verification retry limit — 3 attempts**
+Industry standard for high-friction identity flows (banks, call-centre scripts). Low enough to deter brute-forcing; high enough that a genuine user who mis-types once can still succeed. On exhaustion the session transitions to `FAILED` and the user is directed to support. Correct values are never revealed.
+
+**Invalid date format does not consume a retry**
+If a user enters `1989-02-29` (not a leap year), the date is structurally wrong — not a genuine failed attempt. The agent re-prompts for a valid date without decrementing the attempt counter.
+
+**Zero-balance account (ACC1003) — verified but no payment collected**
+After verification the agent informs the user there is nothing owed and closes gracefully. Entering the payment collection state with ₹0.00 balance would confuse the user and serve no purpose.
+
+**Leap year date validation (ACC1004 — DOB `1988-02-29`)**
+`datetime.date(year, month, day)` raises `ValueError` for non-existent dates (e.g. `1989-02-29`). The validator catches this and returns a clear error message. `1988-02-29` is a real date (1988 is divisible by 4) and passes correctly.
+
+**Terminal vs retryable payment failures**
+User-fixable errors (`invalid_card`, `invalid_cvv`, `invalid_expiry`, `insufficient_balance`, `invalid_amount`) → clear the bad field, re-prompt.
+Unknown API errors → transition to `FAILED`, apologise, direct to support. The distinction is made by checking the `error_code` from the API response against a known set.
+
+**LLM never makes business decisions**
+The LLM is used only for (1) extracting structured fields from free text and (2) generating natural language replies. All pass/fail decisions — verification, validation, state transitions, API calls — are pure Python. This makes the agent auditable, testable, and impossible to "jailbreak" into skipping a step.
